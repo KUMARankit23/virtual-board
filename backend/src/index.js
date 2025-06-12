@@ -1,155 +1,88 @@
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const dotenv = require('dotenv');
 const mongoose = require('mongoose');
-const { createServer } = require('http');
+const http = require('http');
 const { Server } = require('socket.io');
-const Whiteboard = require('./models/Whiteboard'); // Import the Whiteboard model
-const authRoutes = require('./routes/auth'); // Import auth routes
-const boardRoutes = require('./routes/boards'); // Import board routes
-const jwt = require('jsonwebtoken'); // Import jwt
-const Board = require('./models/Board'); // Import Board model
 
-// Load environment variables
-dotenv.config();
+const Board = require('./models/Board');
 
 const app = express();
-const httpServer = createServer(app);
-const io = new Server(httpServer, {
-  cors: {
-    origin: process.env.NODE_ENV === 'production' 
-      ? 'https://your-production-domain.com' 
-      : 'http://localhost:3000',
-    methods: ['GET', 'POST']
-  }
-});
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: '*' } });
 
-// Socket.IO authentication middleware
-io.use(async (socket, next) => {
-  const token = socket.handshake.auth.token;
-  if (!token) {
-    return next(new Error('Authentication error: No token provided'));
-  }
-  try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    socket.user = decoded.user; // Attach user info to socket
-    next();
-  } catch (err) {
-    next(new Error('Authentication error: Invalid token'));
-  }
-});
-
-// Middleware
-app.use(cors());
+app.use(cors({
+  origin: ['http://localhost:3000', 'http://localhost:3001'],
+  credentials: true
+}));
 app.use(express.json());
 
-// Use auth routes
+// Routes
+const authRoutes = require('./routes/auth');
+const boardRoutes = require('./routes/boards');
 app.use('/api/auth', authRoutes);
-app.use('/api/boards', boardRoutes); // Use board routes
+app.use('/api/boards', boardRoutes);
 
-// Database connection
-mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/virtual_board')
-  .then(() => console.log('Connected to MongoDB'))
-  .catch((err) => console.error('MongoDB connection error:', err));
+// MongoDB connection
+mongoose.connect(process.env.MONGODB_URI)
+  .then(() => console.log('MongoDB connected'))
+  .catch(err => console.error('MongoDB connection error:', err));
 
-// Basic route for testing
-app.get('/', (req, res) => {
-  res.json({ message: 'Virtual Board API is running' });
+// Socket.io for board sessions
+io.on('connection', (socket) => {
+  socket.on('joinBoard', async (boardId) => {
+    socket.join(boardId);
+    // After io.on('connection', ...) and inside the function:
+socket.on('inviteUser', ({ boardId, username }) => {
+  io.to(boardId).emit('userInvited', { username });
 });
 
-// Socket.IO connection handling
-io.on('connection', (socket) => {
-  console.log('User connected:', socket.id);
-
-  socket.on('join-room', async (roomId) => {
-    // Verify user is a member of this board
-    const board = await Board.findById(roomId);
-    if (!board || !board.members.some(member => member.userId.toString() === socket.user.id)) {
-      console.log(`User ${socket.user.id} not authorized to join room ${roomId}`);
-      socket.emit('auth-error', 'Not authorized to join this board.');
-      return;
-    }
-
-    socket.join(roomId);
-    console.log(`User ${socket.user.id} joined room ${roomId}`);
-
-    // Load existing whiteboard data for the room
-    let whiteboard = await Whiteboard.findOne({ roomId });
-    if (whiteboard) {
-      socket.emit('load-whiteboard', whiteboard.elements);
-    } else {
-      // Create a new whiteboard if it doesn't exist
-      whiteboard = new Whiteboard({ roomId, elements: [] });
-      await whiteboard.save();
+    // Send current board data to the joining client
+    try {
+      const board = await Board.findOne({ boardId });
+      if (board && board.data) {
+        socket.emit('boardData', board.data);
+      }
+    } catch (err) {
+      console.error('Error sending board data:', err);
     }
   });
 
   socket.on('draw', async (data) => {
-    // Check if user is authorized for this board
-    const board = await Board.findById(data.roomId);
-    if (!board || !board.members.some(member => member.userId.toString() === socket.user.id)) {
-      return;
+    socket.to(data.boardId).emit('draw', data);
+
+    // Save the drawing action to the board in MongoDB, create if not exists
+    try {
+      await Board.findOneAndUpdate(
+        { boardId: data.boardId },
+        { $push: { data } },
+        { upsert: true } // <-- Ensures board is created if missing
+      );
+    } catch (err) {
+      console.error('Error saving draw action:', err);
     }
-    socket.to(data.roomId).emit('draw', data.drawingData);
-    // Save drawing data to MongoDB
-    await Whiteboard.findOneAndUpdate(
-      { roomId: data.roomId },
-      { $push: { elements: { type: 'draw', ...data.drawingData } } },
-      { upsert: true }
-    );
   });
 
-  socket.on('text', async (data) => {
-    // Check if user is authorized for this board
-    const board = await Board.findById(data.roomId);
-    if (!board || !board.members.some(member => member.userId.toString() === socket.user.id)) {
-      return;
+  socket.on('clear', async (boardId) => {
+    socket.to(boardId).emit('clear');
+    // Clear the board data in MongoDB, create if not exists
+    try {
+      await Board.findOneAndUpdate(
+        { boardId },
+        { $set: { data: [] } },
+        { upsert: true } // <-- Ensures board is created if missing
+      );
+    } catch (err) {
+      console.error('Error clearing board:', err);
     }
-    socket.to(data.roomId).emit('text', data.textData);
-    // Save text data to MongoDB
-    await Whiteboard.findOneAndUpdate(
-      { roomId: data.roomId },
-      { $push: { elements: { type: 'text', ...data.textData } } },
-      { upsert: true }
-    );
-  });
-
-  socket.on('shape', async (data) => {
-    // Check if user is authorized for this board
-    const board = await Board.findById(data.roomId);
-    if (!board || !board.members.some(member => member.userId.toString() === socket.user.id)) {
-      return;
-    }
-    socket.to(data.roomId).emit('shape', data.shapeData);
-    // Save shape data to MongoDB
-    await Whiteboard.findOneAndUpdate(
-      { roomId: data.roomId },
-      { $push: { elements: { type: 'shape', ...data.shapeData } } },
-      { upsert: true }
-    );
-  });
-
-  socket.on('clear-whiteboard', async (roomId) => {
-    // Check if user is authorized for this board
-    const board = await Board.findById(roomId);
-    if (!board || !board.members.some(member => member.userId.toString() === socket.user.id)) {
-      return;
-    }
-    await Whiteboard.findOneAndUpdate(
-      { roomId: roomId },
-      { $set: { elements: [] } },
-      { upsert: true }
-    );
-    socket.to(roomId).emit('clear-canvas'); // Inform other clients to clear their canvas
   });
 
   socket.on('disconnect', () => {
-    console.log('User disconnected:', socket.id);
+    // Optional: handle disconnect
   });
 });
 
-// Start server
 const PORT = process.env.PORT || 5000;
-httpServer.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
-}); 
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
