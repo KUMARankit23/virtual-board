@@ -1,82 +1,37 @@
 const express = require('express');
+const Board = require('../models/Board');
 const router = express.Router();
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-const User = require('../models/User');
 
-// Register User
-router.post('/register', async (req, res) => {
+// Invite user to board (admin only)
+router.post('/invite', async (req, res) => {
+  const { boardId, username } = req.body;
   try {
-    const { username, email, password } = req.body;
-
-    let user = await User.findOne({ email });
-    if (user) {
-      return res.status(400).json({ msg: 'User already exists' });
-    }
-
-    user = new User({
-      username,
-      email,
-      password,
-    });
-
-    await user.save();
-
-    const payload = {
-      user: {
-        id: user.id,
-      },
-    };
-
-    jwt.sign(
-      payload,
-      process.env.JWT_SECRET,
-      { expiresIn: '1h' },
-      (err, token) => {
-        if (err) throw err;
-        res.json({ token });
-      }
+    const board = await Board.findOneAndUpdate(
+      { boardId },
+      { $addToSet: { invitedUsers: username } }, // prevents duplicates
+      { new: true }
     );
+    if (!board) return res.status(404).json({ msg: 'Board not found' });
+    res.json({ msg: 'User invited', board });
   } catch (err) {
-    console.error(err.message);
-    res.status(500).send('Server error');
+    res.status(500).json({ msg: err.message || 'Server error' });
   }
 });
 
-// Login User
-router.post('/login', async (req, res) => {
+// Create a new board
+router.post('/create', async (req, res) => {
+  const { boardId, invitedUsers } = req.body;
   try {
-    const { email, password } = req.body;
-
-    let user = await User.findOne({ email });
-    if (!user) {
-      return res.status(400).json({ msg: 'Invalid Credentials' });
+    if (!boardId) return res.status(400).json({ msg: 'Board ID is required' });
+    let board = await Board.findOne({ boardId });
+    if (!board) {
+      board = new Board({ boardId, invitedUsers: invitedUsers || [], data: [] });
+      await board.save();
     }
-
-    const isMatch = await user.comparePassword(password);
-    if (!isMatch) {
-      return res.status(400).json({ msg: 'Invalid Credentials' });
-    }
-
-    const payload = {
-      user: {
-        id: user.id,
-      },
-    };
-
-    jwt.sign(
-      payload,
-      process.env.JWT_SECRET,
-      { expiresIn: '1h' },
-      (err, token) => {
-        if (err) throw err;
-        res.json({ token });
-      }
-    );
+    res.json({ msg: 'Board created', boardId });
   } catch (err) {
-    console.error(err.message);
-    res.status(500).send('Server error');
+    res.status(500).json({ msg: err.message || 'Server error' });
   }
 });
 
-module.exports = router; 
+module.exports = router;
